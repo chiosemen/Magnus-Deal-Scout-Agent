@@ -1,0 +1,167 @@
+# Dockerfile
+
+FROM python:3.11-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Create non-root user
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+# Expose port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
+    CMD python -c "import httpx; httpx.get('http://localhost:8000/health')"
+
+# Run application
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+
+# docker-compose.yml
+
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: dealscout-postgres
+    environment:
+      POSTGRES_USER: dealscout
+      POSTGRES_PASSWORD: dealscout_password
+      POSTGRES_DB: dealscout
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dealscout"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache & Message Broker
+  redis:
+    image: redis:7-alpine
+    container_name: dealscout-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # FastAPI Application
+  api:
+    build: .
+    container_name: dealscout-api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Celery Worker
+  celery-worker:
+    build: .
+    container_name: dealscout-celery-worker
+    command: celery -A app.core.celery_app worker --loglevel=info --concurrency=4
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Celery Beat Scheduler
+  celery-beat:
+    build: .
+    container_name: dealscout-celery-beat
+    command: celery -A app.core.celery_app beat --loglevel=info
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Flower (Celery Monitoring)
+  flower:
+    build: .
+    container_name: dealscout-flower
+    command: celery -A app.core.celery_app flower --port=5555
+    volumes:
+      - .:/app
+    ports:
+      - "5555:5555"
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - celery-worker
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+
+
+# .dockerignore
+
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+.venv
+*.egg-info/
+dist/
+build/
+*.log
+.git
+.gitignore
+README.md
+.env
+.env.local
+docker-compose.override.yml
